@@ -10,10 +10,8 @@ set -euo pipefail
 
 #── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-# Size threshold for “large folder” (in bytes). e.g. 500M = 500*1024*1024
-MIN_SIZE_BYTES=$((500 * 1024 * 1024))
+MIN_SIZE_BYTES=$((500 * 1024 * 1024))   # 500 MB threshold
 
-# Paths to exclude from ANY scanning or deletion
 EXCLUDES=(
   "/System"
   "/Applications"
@@ -25,7 +23,6 @@ EXCLUDES=(
   "/dev"
 )
 
-# Extra cache targets for Homebrew, Xcode, Docker, etc.
 CACHE_PATHS=(
   "~/Library/Caches"
   "/Library/Caches"
@@ -38,85 +35,77 @@ CACHE_PATHS=(
   "/Users/$USER/.cache"
 )
 
-# Quarantine folder prefix (for backup instead of rm)
 QUARANTINE_DIR=~/Desktop/mac_cleaner_quarantine_$(date +%Y%m%d_%H%M%S)
 
 #── SETUP ──────────────────────────────────────────────────────────────────────
 
-# Color helpers
 RED=$(tput setaf 1)
 GREEN=$(tput setaf 2)
 YELLOW=$(tput setaf 3)
 CYAN=$(tput setaf 6)
 RESET=$(tput sgr0)
 
-LOGFILE=~/Desktop/cleaner_log_$(date +%Y%m%d_%H%M%S).txt
-touch "$LOGFILE"
+LOGFILE_TMP=/tmp/cleaner_log_$(date +%Y%m%d_%H%M%S).txt
+: > "$LOGFILE_TMP"
 
-# Build find exclude args
 EXCLUDE_ARGS=()
 for p in "${EXCLUDES[@]}"; do
   EXCLUDE_ARGS+=( -path "$p" -prune -o )
 done
 
-# Trap Ctrl+C
-trap 'echo -e "\n${YELLOW}Interrupted by user; exiting cleanly.${RESET}" >>"$LOGFILE"; exit 1' INT
+trap 'echo -e "\n${YELLOW}Interrupted by user; exiting cleanly.${RESET}" >>"$LOGFILE_TMP"; exit 1' INT
 
-# Require sudo upfront
 echo "${CYAN}🔐  Requesting sudo permissions...${RESET}"
 sudo -v
 
 #── UTILITY FUNCTIONS ──────────────────────────────────────────────────────────
 
-log()   { echo -e "$*" | tee -a "$LOGFILE"; }
+log()   { echo -e "$*" | tee -a "$LOGFILE_TMP"; }
 abort() { echo -e "${RED}✖ $*${RESET}"; exit 2; }
 
-size_human() { numfmt --to=iec --suffix=B --format="%.1f" "$1"; }
+size_human() { awk -v bytes="$1" 'BEGIN {
+  split("B KB MB GB TB PB", units);
+  for (i=1; bytes>=1024 && i<6; i++) bytes/=1024;
+  printf "%.1f%s\n", bytes, units[i]
+}'; }
 
-# List top N largest folders under /
 scan_large_folders() {
   sudo du -x -B1 -d1 / "${EXCLUDE_ARGS[@]}" \
     2>/dev/null | sort -nrk1 | awk -v min="$MIN_SIZE_BYTES" '$1>=min' | head -n20
 }
 
-# Cleanup caches (with optional backup)
 cleanup_caches() {
   log "${CYAN}🧹 Clearing known caches...${RESET}"
   for path in "${CACHE_PATHS[@]}"; do
     eval target=${path/#\~/$HOME}
     if [ -d "$target" ]; then
-      sudo find "$target" -mindepth 1 -maxdepth 1 -exec sudo rm -rf {} \; \
-        && log "  • Cleared $target" \
-        || log "${YELLOW}  • Skipped $target${RESET}"
+      sudo find "$target" -mindepth 1 -maxdepth 1 -exec sudo rm -rf {} \; 2>/dev/null || true
+      log "  • Cleared $target"
     fi
   done
 }
 
-# Quarantine instead of rm if backup was requested
 delete_or_quarantine() {
   local item=$1
   if [ "$DRY_RUN" = true ]; then
     log "  [DRY] Would delete $item"
   elif [ "$QUARANTINE" = true ]; then
     mkdir -p "$QUARANTINE_DIR"
-    sudo mv "$item" "$QUARANTINE_DIR"/ \
-      && log "  • Quarantined $item" \
-      || log "${YELLOW}  • Failed to quarantine $item${RESET}"
+    sudo mv "$item" "$QUARANTINE_DIR"/ 2>/dev/null || true
+    log "  • Quarantined $item"
   else
-    sudo rm -rf "$item" \
-      && log "  • Deleted $item" \
-      || log "${YELLOW}  • Failed to delete $item${RESET}"
+    sudo rm -rf "$item" 2>/dev/null || true
+    log "  • Deleted $item"
   fi
 }
 
 #── MAIN ───────────────────────────────────────────────────────────────────────
 
 echo "${GREEN}⚙️  Starting full-machine storage cleanup.${RESET}"
-log "Logfile: $LOGFILE"
+log "Logfile: $LOGFILE_TMP"
 log "Excluding: ${EXCLUDES[*]}"
 log "Threshold: $(size_human $MIN_SIZE_BYTES)"
 
-# Ask for dry run / quarantine / real delete
 echo
 read -p "🚦  Dry-run only? (no deletions) [y/N]: " ans
 DRY_RUN=false; [[ $ans =~ ^[Yy] ]] && DRY_RUN=true
@@ -131,15 +120,19 @@ read -p "❗  Do you want to auto-clear caches first? [Y/n]: " ans
 
 echo
 log "${CYAN}📊 Scanning for large folders...${RESET}"
-mapfile -t LARGE < <(scan_large_folders | awk '{print $1" "$2}')
-echo "${CYAN}Found ${#LARGE[@]} folders above threshold.${RESET}" | tee -a "$LOGFILE"
 
-# Ask to delete each
+LARGE=()
+while IFS= read -r line; do
+  LARGE+=("$line")
+done < <(scan_large_folders | awk '{print $1" "$2}')
+
+echo "${CYAN}Found ${#LARGE[@]} folders above threshold.${RESET}" | tee -a "$LOGFILE_TMP"
+
 for entry in "${LARGE[@]}"; do
   size=$(echo "$entry" | awk '{print $1}')
   dir=$(echo "$entry" | awk '{print $2}')
   echo
-  echo -e "${YELLOW}📂 $dir${RESET} — ${size_human $size}"
+  echo -e "${YELLOW}📂 $dir${RESET} — $(size_human $size)"
   echo "Contents preview:"
   sudo du -x -h -d1 "$dir" 2>/dev/null | sort -hr | head -10
 
@@ -151,7 +144,6 @@ for entry in "${LARGE[@]}"; do
   fi
 done
 
-# Summary
 echo
 echo "${GREEN}🎉 Cleanup session complete!${RESET}"
 if [ "$DRY_RUN" = true ]; then
@@ -159,6 +151,8 @@ if [ "$DRY_RUN" = true ]; then
 elif [ "$QUARANTINE" = true ]; then
   echo "— Items moved to quarantine: $QUARANTINE_DIR"
 fi
-echo "— Detailed log at: $LOGFILE"
+
+cp "$LOGFILE_TMP" ~/Desktop/ 2>/dev/null || true
+echo "— Detailed log at: ~/Desktop/$(basename "$LOGFILE_TMP")"
 
 exit 0
